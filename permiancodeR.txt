@@ -1,0 +1,604 @@
+#------------------------------------------------------------
+# Permian Basin Paper Code
+# Will Jones | UH Dept of Economics
+# TWFE + IV + Robustness
+
+# Run from the folder containing data1.csv 
+# AVAILABLE UPON REQUEST
+
+# package install
+# IF NEEDED:
+# install.packages(c("tidyverse", "plm", "lmtest", "sandwich", "ivreg",
+#                    "stargazer", "fixest", "patchwork"))
+#------------------------------------------------------------
+library(tidyverse)
+library(plm)
+library(lmtest)
+library(sandwich)
+library(ivreg)   # IV estimation
+library(stargazer)
+library(fixest)   # county-specific trends
+
+# 1 Load in Data
+df <- read_csv("data1.csv") %>%
+  select(year, county, class,
+         teenbirths, medHHincome1k, assocorhigher,
+         povertypercent, drugPoisRate, singleParents,
+         percentDisYouth, unemp, crime100k, RESpopulation) %>%
+  # Drop things2doPC — time-invariant, absorbed by FE, weak construction
+  # Retained qualitatively in Section 5.4
+  mutate(
+    log_income   = log(medHHincome1k),
+    log_pop      = log(RESpopulation),
+    permian_flag = as.integer(class == "Permian")
+  )
+
+# 2 WTI Oil Price (2009-2021)
+# Annual average WTI crude oil price, USD per barrel
+# Source: EIA
+wti <- tibble(
+  year = 2009:2021,
+  wti_price = c(61.95, 79.48, 94.88, 94.05, 97.98,
+                93.17, 48.66, 43.29, 50.80, 65.23,
+                56.99, 39.57, 68.17)
+)
+
+df <- df %>% left_join(wti, by = "year")
+
+# instrument
+df <- df %>%
+  mutate(wti_permian = wti_price * permian_flag)
+
+# 3
+# teenbirths available through 2020
+# drugPoisRate available through 2021
+df_teen <- df %>% filter(!is.na(teenbirths))   # 2009-2020
+df_drug <- df %>% filter(!is.na(drugPoisRate)) # 2009-2021
+
+pdata_teen <- pdata.frame(df_teen, index = c("county", "year"))
+pdata_drug <- pdata.frame(df_drug, index = c("county", "year"))
+
+# model 1: baseline TWFE (main spec)
+m1 <- plm(teenbirths ~ medHHincome1k + assocorhigher +
+            povertypercent + singleParents + percentDisYouth,
+          data   = pdata_teen,
+          model  = "within",
+          effect = "twoways")
+
+# model 2: drugpoisoning rate added
+m2 <- plm(teenbirths ~ medHHincome1k + assocorhigher +
+            povertypercent + singleParents + percentDisYouth +
+            drugPoisRate,
+          data   = pdata_teen %>% filter(!is.na(drugPoisRate)),
+          model  = "within",
+          effect = "twoways")
+
+# model 3: log income instead of levels
+m3 <- plm(teenbirths ~ log_income + assocorhigher +
+            povertypercent + singleParents + percentDisYouth,
+          data   = pdata_teen,
+          model  = "within",
+          effect = "twoways")
+
+# cluster robust county SEs 
+se_m1 <- coeftest(m1, vcov = vcovHC(m1, type = "HC1", cluster = "group"))
+se_m2 <- coeftest(m2, vcov = vcovHC(m2, type = "HC1", cluster = "group"))
+se_m3 <- coeftest(m3, vcov = vcovHC(m3, type = "HC1", cluster = "group"))
+
+print(se_m1)
+print(se_m2)
+print(se_m3)
+
+# SPHS mediator check
+# model 1 excluding single-parent share
+m1_nosp <- plm(teenbirths ~ medHHincome1k + assocorhigher +
+                 povertypercent + percentDisYouth,
+               data   = pdata_teen,
+               model  = "within",
+               effect = "twoways")
+se_m1_nosp <- coeftest(m1_nosp, vcov = vcovHC(m1_nosp, type = "HC1", cluster = "group"))
+print(se_m1_nosp)
+
+# SPHS as the outcome: asking incomes effect on singleparents
+m_sp <- plm(singleParents ~ medHHincome1k + assocorhigher +
+              povertypercent + percentDisYouth,
+            data   = pdata_teen,
+            model  = "within",
+            effect = "twoways")
+se_m_sp <- coeftest(m_sp, vcov = vcovHC(m_sp, type = "HC1", cluster = "group"))
+print(se_m_sp)
+
+# parallel trends
+# TWFE assumes no county-specific trends correlated with income.
+# checking county specific linear trends + leads test
+
+# county-specific linear time trends
+df_trend <- df_teen %>%
+  mutate(t = year - min(year))
+
+m1_trend <- feols(teenbirths ~ medHHincome1k + assocorhigher +
+                    povertypercent + singleParents + percentDisYouth |
+                    county[t] + year,
+                  data    = df_trend,
+                  cluster = ~county)
+summary(m1_trend)
+
+# leads test: does future income predict teen births (reverse causality)
+df_lead <- df %>%
+  arrange(county, year) %>%
+  group_by(county) %>%
+  mutate(inc_lead = dplyr::lead(medHHincome1k)) %>%
+  ungroup() %>%
+  filter(!is.na(teenbirths), !is.na(inc_lead))
+
+pdata_lead <- pdata.frame(df_lead, index = c("county", "year"))
+
+m1_lead <- plm(teenbirths ~ medHHincome1k + inc_lead + assocorhigher +
+                 povertypercent + singleParents + percentDisYouth,
+               data   = pdata_lead,
+               model  = "within",
+               effect = "twoways")
+se_m1_lead <- coeftest(m1_lead, vcov = vcovHC(m1_lead, type = "HC1", cluster = "group"))
+print(se_m1_lead)
+
+# diagnostic: how much does a linear trend explain?
+trend_share <- function(v) {
+  d <- df_trend %>% filter(!is.na(.data[[v]]))
+  ss_fe <- 0
+  ss_tr <- 0
+  for (cty in unique(d$county)) {
+    g <- d %>% filter(county == cty)
+    ss_fe <- ss_fe + sum((g[[v]] - mean(g[[v]]))^2)
+    ss_tr <- ss_tr + sum(resid(lm(g[[v]] ~ g$t))^2)
+  }
+  1 - ss_tr / ss_fe
+}
+sapply(c("teenbirths", "medHHincome1k", "singleParents"), trend_share)
+
+# IV
+# instrument = WTI * Permian flag for income endogeneity
+
+df_iv <- df_teen %>%
+  mutate(
+    county_f = factor(county),
+    year_f   = factor(year)
+  ) %>%
+  filter(!is.na(teenbirths), !is.na(wti_price))
+
+iv_m1 <- ivreg(
+  teenbirths ~ medHHincome1k + assocorhigher +
+    povertypercent + singleParents + percentDisYouth +
+    county_f + year_f |
+    wti_permian + assocorhigher +
+    povertypercent + singleParents + percentDisYouth +
+    county_f + year_f,
+  data = df_iv
+)
+
+# diagnostics
+summary(iv_m1, diagnostics = TRUE)
+
+# SEs clustered by county
+vcov_iv <- vcovCL(iv_m1, cluster = ~county)
+coeftest(iv_m1, vcov = vcov_iv)[c("medHHincome1k", "singleParents"), ]
+
+# 7 robustness: drug poisoning as outcome
+m_drug <- plm(drugPoisRate ~ medHHincome1k + assocorhigher +
+                povertypercent + singleParents + percentDisYouth +
+                unemp,
+              data   = pdata_drug,
+              model  = "within",
+              effect = "twoways")
+
+se_drug <- coeftest(m_drug, vcov = vcovHC(m_drug, type = "HC1", cluster = "group"))
+print(se_drug)
+
+# 8 heterogeneiety by county type
+df_het <- df_teen %>%
+  mutate(
+    permian_income = medHHincome1k * permian_flag,
+    county_f = factor(county),
+    year_f   = factor(year)
+  )
+
+m_het <- lm(teenbirths ~ medHHincome1k + permian_income +
+              assocorhigher + povertypercent + singleParents +
+              percentDisYouth + county_f + year_f,
+            data = df_het)
+
+# SEs clustered by county
+coeftest(m_het, vcov = vcovCL(m_het, cluster = ~county))[c("medHHincome1k", "permian_income"), ]
+
+# 9 exports result table TEX
+stargazer(m1, m2, m3,
+          se    = list(se_m1[, 2], se_m2[, 2], se_m3[, 2]),
+          p     = list(se_m1[, 4], se_m2[, 4], se_m3[, 4]),
+          type  = "latex",
+          title = "Two-Way Fixed Effects: Predictors of Teen Birth Rate",
+          dep.var.labels = "Teen Birth Rate (per 1,000 females 15-19)",
+          covariate.labels = c("Median HH Income ($k)",
+                               "Log Median HH Income",
+                               "Assoc. Degree or Higher (%)",
+                               "Poverty Rate (%)",
+                               "Single Parent HH (%)",
+                               "Disconnected Youth (%)",
+                               "Drug Poisoning Rate"),
+          add.lines    = list(c("County FE", "Yes", "Yes", "Yes"),
+                              c("Year FE",   "Yes", "Yes", "Yes")),
+          notes        = "Cluster-robust SEs at county level.",
+          out          = "results_table.tex")
+
+cat("\nDone. Check results_table.tex for LaTeX output.\n")
+
+#------------------------------------------------------------
+# Figure Generation
+# A Look Into the Social and Economic Pressures of the Permian Basin
+# Will Jones | University of Houston
+#------------------------------------------------------------
+# Run this script in the same directory as data1.csv
+# Output: 9 PNG files to same directory
+#------------------------------------------------------------
+
+library(tidyverse)
+
+# theme
+theme_permian <- function() {
+  theme_classic(base_size = 13, base_family = "serif") +
+    theme(
+      plot.title    = element_text(face = "bold", size = 13),
+      axis.title    = element_text(size = 12),
+      axis.text     = element_text(size = 11),
+      legend.title  = element_blank(),
+      legend.text   = element_text(size = 11),
+      legend.position = "bottom",
+      plot.caption  = element_text(size = 9, hjust = 0, color = "gray40")
+    )
+}
+
+
+W <- 8   # inches
+H <- 5   # inches
+DPI <- 300
+
+# ---- Load data ----
+df <- read_csv("data1.csv") %>%
+  select(year, county, class,
+         medHHincome1k, assocorhigher, teenbirths,
+         drugPoisRate, povertypercent, singleParents,
+         crime100k, RESpopulation)
+
+#------------------------------------------------------------
+# FIGURE 1
+# Educational attainment over time: Dallas vs Ector County
+#------------------------------------------------------------
+
+fig1_data <- df %>%
+  filter(county %in% c("Dallas", "Ector")) %>%
+  select(year, county, assocorhigher)
+
+fig1 <- ggplot(fig1_data, aes(x = year, y = assocorhigher,
+                              color = county, linetype = county)) +
+  geom_line(linewidth = 1.1) +
+  scale_color_manual(values = c("Dallas" = "red", "Ector" = "black"),
+                     labels = c("Dallas County", "Ector County")) +
+  scale_linetype_manual(values = c("Dallas" = "solid", "Ector" = "solid"),
+                        labels = c("Dallas County", "Ector County")) +
+  scale_x_continuous(breaks = seq(2009, 2023, 2)) +
+  labs(
+    title = "Educational Attainment Over Time: Dallas and Ector Counties",
+    x     = "Year",
+    y     = "Population with Associate's Degree or Higher (%)"
+  ) +
+  theme_permian()
+
+ggsave("fig1_educ_attainment_dallas_ector.png",
+       fig1, width = W, height = H, dpi = DPI)
+cat("Figure 1 saved.\n")
+
+#------------------------------------------------------------
+# FIGURE 2
+# Teen birth rate over time: Ector County
+#------------------------------------------------------------
+
+fig2_data <- df %>%
+  filter(county == "Ector", !is.na(teenbirths))
+
+fig2 <- ggplot(fig2_data, aes(x = year, y = teenbirths)) +
+  geom_line(linewidth = 1.2, color = "black") +
+  geom_point(size = 2.5, color = "black") +
+  scale_x_continuous(breaks = seq(2009, 2020, 2)) +
+  labs(
+    title = "Teen Birth Rate Over Time: Ector County",
+    x     = "Year",
+    y     = "Births per 1,000 Females Aged 15–19"
+  ) +
+  theme_permian() +
+  theme(legend.position = "none")
+
+ggsave("fig2_teen_birth_rate_ector.png",
+       fig2, width = W, height = H, dpi = DPI)
+cat("Figure 2 saved.\n")
+
+#------------------------------------------------------------
+# FIGURE 3
+# ECISD campuses by accountability rating
+# Manual data from TEA
+#------------------------------------------------------------
+
+fig3_data <- tibble(
+  rating = factor(c("D", "F", "C", "Not Rated", "A", "B"),
+                  levels = c("D", "F", "C", "Not Rated", "A", "B")),
+  count  = c(11, 11, 10, 7, 5, 2)
+)
+
+fig3 <- ggplot(fig3_data, aes(x = rating, y = count)) +
+  geom_col(fill = "black", color = "black", width = 0.6) +
+  geom_text(aes(label = count), vjust = -0.5, size = 4, fontface = "bold") +
+  labs(
+    title = "ECISD Campuses by Academic Accountability Rating",
+    x     = "TEA Accountability Rating",
+    y     = "Number of Campuses"
+  ) +
+  theme_permian() +
+  theme(legend.position = "none")
+
+ggsave("fig3_ecisd_accountability_ratings.png",
+       fig3, width = W, height = H, dpi = DPI)
+cat("Figure 3 saved.\n")
+
+#------------------------------------------------------------
+# FIGURE 4
+# ECISD campuses by post-secondary readiness distinction
+# data from TEA
+#------------------------------------------------------------
+
+fig4_data <- tibble(
+  status = factor(c("Not Earned", "Earned", "Not Rated"),
+                  levels = c("Not Earned", "Earned", "Not Rated")),
+  count  = c(32, 7, 7)
+)
+
+fig4 <- ggplot(fig4_data, aes(x = status, y = count)) +
+  geom_col(fill = "black", color = "black", width = 0.5) +
+  geom_text(aes(label = count), vjust = -0.5, size = 4, fontface = "bold") +
+  labs(
+    title = "ECISD Campuses by Post-Secondary Readiness Distinction",
+    x     = "Distinction Status",
+    y     = "Number of Campuses"
+  ) +
+  theme_permian() +
+  theme(legend.position = "none")
+
+ggsave("fig4_ecisd_postsecondary_readiness.png",
+       fig4, width = W, height = H, dpi = DPI)
+cat("Figure 4 saved.\n")
+
+#------------------------------------------------------------
+# FIGURE 5
+# Low-literate adults across Permian Basin counties
+# data from Literacy Coalition of the Permian Basin (2022)
+#------------------------------------------------------------
+
+fig5_data <- tibble(
+  county  = c("Ector", "Midland", "Lea", "Chaves", "Eddy", "Howard",
+              "Reeves", "Gaines", "Pecos", "Andrews", "Ward", "Yoakum",
+              "Winkler", "Crane", "Martin", "Reagan", "Crockett",
+              "Culberson", "Upton", "Glasscock", "Terrell", "Loving"),
+  pct     = c(36, 26, 39, 36, 29, 31, 50, 42, 44, 37, 33, 40,
+              42, 38, 31, 42, 39, 55, 35, 31, 33, 24),
+  count_k = c(39, 25, 19, 16, 11, 8, 5, 5, 5, 4, 3, 2,
+              2, 1, 1, 1, 1, 1, 1, 3, 2, 0.2)
+) %>%
+  arrange(desc(pct)) %>%
+  mutate(county = factor(county, levels = county))
+
+fig5 <- ggplot(fig5_data, aes(x = pct, y = fct_rev(county))) +
+  geom_col(fill = "black", color = "black", width = 0.7) +
+  geom_text(aes(label = paste0(pct, "%")),
+            hjust = -0.1, size = 3.2) +
+  scale_x_continuous(limits = c(0, 65),
+                     labels = function(x) paste0(x, "%")) +
+  labs(
+    title   = "Low-Literate Adults across Permian Basin Counties",
+    x       = "Percentage of Low-Literate Adults (Ages 16–74)",
+    y       = NULL,
+    caption = "Source: Literacy Coalition of the Permian Basin (2022)."
+  ) +
+  theme_permian() +
+  theme(legend.position = "none")
+
+ggsave("fig5_literacy_permian_basin.png",
+       fig5, width = W, height = 6.5, dpi = DPI)
+cat("Figure 5 saved.\n")
+
+#------------------------------------------------------------
+# FIGURE 6
+# Educational attainment by level: Ector County (2023)
+# data from U.S. Census Bureau ACS
+#------------------------------------------------------------
+
+fig6_data <- tibble(
+  level = factor(
+    c("Less than\n9th grade", "9th–12th grade,\nno diploma",
+      "High school\ngraduate", "Some college,\nno degree",
+      "Associate's\ndegree", "Bachelor's\ndegree",
+      "Graduate or\nprofessional degree"),
+    levels = c("Less than\n9th grade", "9th–12th grade,\nno diploma",
+               "High school\ngraduate", "Some college,\nno degree",
+               "Associate's\ndegree", "Bachelor's\ndegree",
+               "Graduate or\nprofessional degree")
+  ),
+  count_k = c(8.5, 10.2, 33.1, 19.8, 6.1, 13.4, 3.2)
+)
+
+fig6 <- ggplot(fig6_data, aes(x = level, y = count_k)) +
+  geom_col(fill = "black", color = "black", width = 0.65) +
+  labs(
+    title = "Educational Attainment of Ector County Population\nAged 25 and Older (2023)",
+    x     = NULL,
+    y     = "Number of Individuals (Thousands)"
+  ) +
+  theme_permian() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(size = 9)
+  )
+
+ggsave("fig6_educ_attainment_ector_levels.png",
+       fig6, width = W, height = H, dpi = DPI)
+cat("Figure 6 saved.\n")
+
+# ------------------------------------------------------------
+# FIGURE 7
+# Median earnings by sex and industry: Ector County (2023)
+# data from ACS Table S2414
+#------------------------------------------------------------
+
+fig7_data <- tibble(
+  industry = c(
+    "Arts, Entertainment\n& Recreation",
+    "Public Administration",
+    "Utilities",
+    "Finance & Insurance",
+    "Wholesale Trade",
+    "Manufacturing",
+    "Agriculture, Forestry,\nFishing & Mining",
+    "Mining, Quarrying,\nOil & Gas Extraction",
+    "Health Care &\nSocial Assistance",
+    "Other Services",
+    "Transportation &\nWarehousing",
+    "Accommodation &\nFood Services",
+    "Professional, Scientific\n& Technical Services",
+    "Educational Services",
+    "Real Estate &\nRental and Leasing",
+    "Construction",
+    "Admin, Waste Mgmt\n& Support Services",
+    "Retail Trade"
+  ),
+  male   = c(138, 95, 115, 82, 80, 72, 68, 102, 55, 42, 65, 28, 58, 52, 44, 61, 38, 32),
+  female = c(45,  38, 88,  70, 35, 28, 30, 48,  48, 30, 42, 22, 60, 54, 38, 65, 28, 26)
+) %>%
+  pivot_longer(cols = c(male, female),
+               names_to  = "sex",
+               values_to = "earnings") %>%
+  mutate(
+    sex     = factor(sex, levels = c("male", "female"),
+                     labels = c("Male", "Female")),
+    industry = factor(industry, levels = unique(industry))
+  )
+
+fig7 <- ggplot(fig7_data,
+               aes(x = earnings, y = fct_rev(industry),
+                   color = sex, shape = sex)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Male" = "black", "Female" = "red")) +
+  scale_shape_manual(values = c("Male" = 16, "Female" = 17)) +
+  scale_x_continuous(labels = scales::dollar_format(suffix = "k", prefix = "$")) +
+  labs(
+    title   = "Median Income by Sex and Industry, Ector County, TX (2023)",
+    x       = "Median Earnings",
+    y       = NULL,
+    caption = "Source: U.S. Census Bureau, ACS 1-Year Estimates, Table S2414."
+  ) +
+  theme_permian() +
+  theme(axis.text.y = element_text(size = 8))
+
+ggsave("fig7_earnings_by_sex_industry_ector.png",
+       fig7, width = W, height = 7, dpi = DPI)
+cat("Figure 7 saved.\n")
+
+#------------------------------------------------------------
+# FIGURE 8
+# Educational attainment and income: Ector, Midland, Harris (2009-2023)
+#------------------------------------------------------------
+
+fig8_data <- df %>%
+  filter(county %in% c("Ector", "Midland", "Harris")) %>%
+  select(year, county, assocorhigher, medHHincome1k)
+
+# Build two separate panels rather than dual axis (cleaner for publication)
+fig8_educ <- fig8_data %>%
+  ggplot(aes(x = year, y = assocorhigher,
+             color = county, linetype = county)) +
+  geom_line(linewidth = 1.0) +
+  scale_color_manual(
+    values = c("Ector" = "black", "Midland" = "red", "Harris" = "gray50")
+  ) +
+  scale_linetype_manual(
+    values = c("Ector" = "solid", "Midland" = "dashed", "Harris" = "dotted")
+  ) +
+  scale_x_continuous(breaks = seq(2009, 2023, 2)) +
+  labs(x = "Year",
+       y = "Assoc. Degree or Higher (%)") +
+  theme_permian() +
+  theme(legend.position = "none",
+        plot.title = element_blank())
+
+fig8_inc <- fig8_data %>%
+  ggplot(aes(x = year, y = medHHincome1k,
+             color = county, linetype = county)) +
+  geom_line(linewidth = 1.0) +
+  scale_color_manual(
+    values = c("Ector" = "black", "Midland" = "red", "Harris" = "gray50"),
+    labels = c("Ector County", "Harris County", "Midland County")
+  ) +
+  scale_linetype_manual(
+    values = c("Ector" = "solid", "Midland" = "dashed", "Harris" = "dotted"),
+    labels = c("Ector County", "Harris County", "Midland County")
+  ) +
+  scale_x_continuous(breaks = seq(2009, 2023, 2)) +
+  labs(x = "Year",
+       y = "Median Household Income ($k)") +
+  theme_permian() +
+  theme(legend.position = "bottom")
+
+# Stack panels using patchwork
+library(patchwork)
+fig8 <- (fig8_educ / fig8_inc) +
+  plot_annotation(
+    title = "Educational Attainment and Median Household Income:\nEctor, Midland, and Harris Counties (2009–2023)"
+  ) &
+  theme(plot.title = element_text(face = "bold", size = 12, family = "serif"))
+
+ggsave("fig8_educ_income_ector_midland_harris.png",
+       fig8, width = W, height = 7.5, dpi = DPI)
+cat("Figure 8 saved.\n")
+
+#------------------------------------------------------------
+# FIGURE 9
+# median household income of selected counties, averaged 2009-2023
+#------------------------------------------------------------
+
+fig9_data <- df %>%
+  group_by(county, class) %>%
+  summarise(avg_income = mean(medHHincome1k, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(avg_income)) %>%
+  mutate(
+    county = factor(county, levels = county),
+    class  = factor(class, levels = c("Permian", "Urban", "Other Rural"))
+  )
+
+fig9 <- ggplot(fig9_data,
+               aes(x = county, y = avg_income, fill = class)) +
+  geom_col(color = "black", linewidth = 0.3, width = 0.75) +
+  scale_fill_manual(
+    values = c("Permian" = "black", "Urban" = "red", "Other Rural" = "gray70")
+  ) +
+  scale_y_continuous(labels = scales::dollar_format(suffix = "k", prefix = "$")) +
+  labs(
+    title   = "Median Household Income of Selected Texas Counties\n(Averaged 2009–2023)",
+    x       = NULL,
+    y       = "Average Median Household Income ($k)",
+    fill    = "County Class"
+  ) +
+  theme_permian() +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1, size = 8),
+    legend.position = "bottom"
+  )
+
+ggsave("fig9_median_income_selected_counties.png",
+       fig9, width = W + 1, height = H + 1, dpi = DPI)
+cat("Figure 9 saved.\n")
+
+cat("\nAll figures saved.\n")
